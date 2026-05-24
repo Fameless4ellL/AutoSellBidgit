@@ -1,7 +1,6 @@
 package bidget
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -16,6 +15,21 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+const (
+	GET       string = "GET"
+	POST      string = "POST"
+	EmptyBody string = "{}"
+)
+
+const (
+	Assets         string = "/api/v2/spot/account/assets"
+	PlaceOrder     string = "/api/v2/spot/trade/place-order"
+	SymbolInfo     string = "/api/v2/spot/public/symbols"
+	UnfilledOrders string = "/api/v2/spot/trade/unfilled-orders"
+)
+
+var client *http.Client = &http.Client{Timeout: 5 * time.Second}
 
 func generateSignature(timestamp, method, requestPath, body, secret string) string {
 	methodUpper := strings.ToUpper(method)
@@ -41,23 +55,20 @@ func formatAmount(amount string, precision int) (string, error) {
 	return fmt.Sprintf(format, truncated), nil
 }
 
-func getBalance() ([]map[string]interface{}, error) {
-	method := "GET"
-	requestPath := "/api/v2/spot/account/assets"
+func PrepareRequest(method, path, body, secret string) (*http.Request, error) {
 	timestamp := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-	body := ""
-
-	signature := generateSignature(timestamp, method, requestPath, body, apiSecret)
-
-	req, _ := http.NewRequest(method, baseURL+requestPath, nil)
+	signature := generateSignature(timestamp, method, path, body, apiSecret)
+	req, _ := http.NewRequest(method, baseURL+path, nil)
 	req.Header.Set("ACCESS-KEY", apiKey)
 	req.Header.Set("ACCESS-SIGN", signature)
 	req.Header.Set("ACCESS-TIMESTAMP", timestamp)
 	req.Header.Set("ACCESS-PASSPHRASE", apiPassphrase)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("locale", "en_US")
+	return req, nil
+}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+func DoRequest(req *http.Request) (map[string]any, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -66,21 +77,34 @@ func getBalance() ([]map[string]interface{}, error) {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(bodyBytes, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	return result, nil
+}
+
+func getBalance() ([]map[string]any, error) {
+	req, err := PrepareRequest(GET, Assets, "", apiSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := DoRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	if result["data"] == nil {
 		return nil, fmt.Errorf("API error: %v", result["msg"])
 	}
 
-	rawData, ok := result["data"].([]interface{})
+	rawData, ok := result["data"].([]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected data format")
 	}
-	var assets []map[string]interface{}
+	var assets []map[string]any
 	for _, item := range rawData {
-		if asset, ok := item.(map[string]interface{}); ok {
+		if asset, ok := item.(map[string]any); ok {
 			assets = append(assets, asset)
 		}
 	}
@@ -88,10 +112,6 @@ func getBalance() ([]map[string]interface{}, error) {
 }
 
 func placeMarketSell(symbol, amount string) error {
-	method := "POST"
-	requestPath := "/api/v2/spot/trade/place-order"
-	timestamp := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-
 	payload := map[string]string{
 		"symbol":    symbol,
 		"side":      "sell",
@@ -101,24 +121,13 @@ func placeMarketSell(symbol, amount string) error {
 	bodyBytes, _ := json.Marshal(payload)
 	body := string(bodyBytes)
 
-	signature := generateSignature(timestamp, method, requestPath, body, apiSecret)
-	req, _ := http.NewRequest(method, baseURL+requestPath, bytes.NewBuffer(bodyBytes))
-	req.Header.Set("ACCESS-KEY", apiKey)
-	req.Header.Set("ACCESS-SIGN", signature)
-	req.Header.Set("ACCESS-TIMESTAMP", string(timestamp))
-	req.Header.Set("ACCESS-PASSPHRASE", apiPassphrase)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	req, err := PrepareRequest(POST, PlaceOrder, body, apiSecret)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return fmt.Errorf("failed to parse JSON: %w", err)
+	result, err := DoRequest(req)
+	if err != nil {
+		return err
 	}
 	if result["msg"] != "success" {
 		return fmt.Errorf("API error: %v", result["msg"])
@@ -127,43 +136,25 @@ func placeMarketSell(symbol, amount string) error {
 }
 
 func GetSymbolInfo(symbol string) (int, error) {
-	method := "GET"
-	requestPath := fmt.Sprintf("/api/v2/spot/public/symbols?symbol=%s", symbol)
-	timestamp := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-
-	payload := map[string]string{}
-	bodyBytes, _ := json.Marshal(payload)
-	body := string(bodyBytes)
-
-	signature := generateSignature(timestamp, method, requestPath, body, apiSecret)
-	req, _ := http.NewRequest(method, baseURL+requestPath, bytes.NewBuffer(bodyBytes))
-	req.Header.Set("ACCESS-KEY", apiKey)
-	req.Header.Set("ACCESS-SIGN", signature)
-	req.Header.Set("ACCESS-TIMESTAMP", string(timestamp))
-	req.Header.Set("ACCESS-PASSPHRASE", apiPassphrase)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	req, err := PrepareRequest(GET, fmt.Sprintf("%s?symbol=%s", SymbolInfo, symbol), EmptyBody, apiSecret)
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return 0, fmt.Errorf("failed to parse JSON: %w", err)
+	result, err := DoRequest(req)
+	if err != nil {
+		return 0, err
 	}
 	if result["msg"] != "success" {
 		return 0, fmt.Errorf("API error: %v", result["msg"])
 	}
 
-	dataSlice, ok := result["data"].([]interface{})
+	dataSlice, ok := result["data"].([]any)
 	if !ok || len(dataSlice) == 0 {
 		return 0, fmt.Errorf("unexpected data format or empty data")
 	}
 
-	firstItem, ok := dataSlice[0].(map[string]interface{})
+	firstItem, ok := dataSlice[0].(map[string]any)
 	if !ok {
 		return 0, fmt.Errorf("unexpected item format in data")
 	}
@@ -185,43 +176,25 @@ func GetSymbolInfo(symbol string) (int, error) {
 	return qpInt, nil
 }
 
-func GetOrderInfo(symbol string) (map[string]interface{}, error) {
-	method := "GET"
-	requestPath := fmt.Sprintf("/api/v2/spot/trade/unfilled-orders?symbol=%s", symbol)
-	timestamp := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-
-	payload := map[string]string{}
-	bodyBytes, _ := json.Marshal(payload)
-	body := string(bodyBytes)
-
-	signature := generateSignature(timestamp, method, requestPath, body, apiSecret)
-	req, _ := http.NewRequest(method, baseURL+requestPath, bytes.NewBuffer(bodyBytes))
-	req.Header.Set("ACCESS-KEY", apiKey)
-	req.Header.Set("ACCESS-SIGN", signature)
-	req.Header.Set("ACCESS-TIMESTAMP", string(timestamp))
-	req.Header.Set("ACCESS-PASSPHRASE", apiPassphrase)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
+func GetOrderInfo(symbol string) (map[string]any, error) {
+	req, err := PrepareRequest(GET, fmt.Sprintf("%s?symbol=%s", UnfilledOrders, symbol), EmptyBody, apiSecret)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	result, err := DoRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	if result["msg"] != "success" {
 		return nil, fmt.Errorf("API error: %v", result["msg"])
 	}
-	dataSlice, ok := result["data"].([]interface{})
+	dataSlice, ok := result["data"].([]any)
 	if !ok || len(dataSlice) == 0 {
 		return nil, fmt.Errorf("unexpected data format or empty data")
 	}
 
-	firstItem, ok := dataSlice[0].(map[string]interface{})
+	firstItem, ok := dataSlice[0].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected item format in data")
 	}
